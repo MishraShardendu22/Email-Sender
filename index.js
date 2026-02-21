@@ -3,6 +3,7 @@ env.config();
 
 import express from "express";
 import nodemailer from "nodemailer";
+import rateLimit from "express-rate-limit";
 
 import cors from "cors";
 
@@ -10,11 +11,29 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { message: "Too many requests, please try again after 15 minutes" },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const emailLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { message: "Too many email requests, please try again after 15 minutes" },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(globalLimiter);
+
 app.get("/", (req, res) => {
   res.send("Email Service is running");
 });
 
-app.post("/send-email", async (req, res) => {
+app.post("/send-email", emailLimiter, async (req, res) => {
   const { email, subject, message, pass1, pass2 } = req.body;
 
   if (pass1 !== process.env.PASS_1 || pass2 !== process.env.PASS_2) {
