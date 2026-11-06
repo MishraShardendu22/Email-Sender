@@ -6,8 +6,8 @@ import express from "express";
 import rateLimit from "express-rate-limit";
 import nodemailer from "nodemailer";
 
-import { secretMatches } from "./lib/auth.js";
-import { parseCommaList, validateLegacy } from "./lib/validate.js";
+import { bearerToken, secretMatches } from "./lib/auth.js";
+import { isSingleAddress, parseCommaList, validateLegacy, validateV2 } from "./lib/validate.js";
 
 const FIFTEEN_MINUTES = 15 * 60 * 1000;
 // Room for a 200 KB text part, a 200 KB html part and the JSON around them.
@@ -92,6 +92,52 @@ export function createApp({
     return transport;
   };
 
+  // Recipients a v2 request may name: ALLOWED_RECIPIENTS plus OWNER_EMAIL.
+  // A leaked token can then only mail the owner's own addresses.
+  const ownerEmail = (env.OWNER_EMAIL ?? "").trim();
+  const allowedRecipients = new Set(parseCommaList(env.ALLOWED_RECIPIENTS));
+  if (isSingleAddress(ownerEmail)) {
+    allowedRecipients.add(ownerEmail.toLowerCase());
+  }
+
+  const v2Mail = (token, body) => {
+    if (!secretMatches(token ?? "", env.SENDER_TOKEN)) {
+      return { status: 401, message: "Unauthorized: Invalid token" };
+    }
+    const invalid = validateV2(body);
+    if (invalid) {
+      return { status: 400, message: invalid };
+    }
+    const to = body.to ?? ownerEmail;
+    if (!isSingleAddress(to)) {
+      log.error("Error sending email: OWNER_EMAIL is not set or not one address");
+      return { status: 500, message: "Failed to send email" };
+    }
+    if (!allowedRecipients.has(to.toLowerCase())) {
+      return { status: 403, message: "Forbidden: recipient is not allowed" };
+    }
+    const mail = { to, subject: body.subject, text: body.text };
+    if (body.html !== undefined) {
+      mail.html = body.html;
+    }
+    return { mail };
+  };
+
+  const legacyMail = (body) => {
+    // Both checks always run so the response time does not show which
+    // password was wrong.
+    const pass1Ok = secretMatches(body.pass1, env.PASS_1);
+    const pass2Ok = secretMatches(body.pass2, env.PASS_2);
+    if (!(pass1Ok && pass2Ok)) {
+      return { status: 401, message: "Unauthorized: Invalid credentials" };
+    }
+    const invalid = validateLegacy(body);
+    if (invalid) {
+      return { status: 400, message: invalid };
+    }
+    return { mail: { to: body.email, subject: body.subject, text: body.message ?? "" } };
+  };
+
   app.get("/", (req, res) => {
     res.send("Email Service is running");
   });
@@ -102,18 +148,15 @@ export function createApp({
       return res.status(400).json({ message: "Request body must be a JSON object" });
     }
 
-    // Both checks always run so the response time does not show which
-    // password was wrong.
-    const pass1Ok = secretMatches(body.pass1, env.PASS_1);
-    const pass2Ok = secretMatches(body.pass2, env.PASS_2);
-    if (!(pass1Ok && pass2Ok)) {
-      return res.status(401).json({ message: "Unauthorized: Invalid credentials" });
+    // A request with an Authorization header is Email API v2; one without
+    // it is the legacy body form. The legacy callers never send the header.
+    const authorization = req.get("authorization");
+    const result =
+      authorization === undefined ? legacyMail(body) : v2Mail(bearerToken(authorization), body);
+    if (result.status) {
+      return res.status(result.status).json({ message: result.message });
     }
-    const invalid = validateLegacy(body);
-    if (invalid) {
-      return res.status(400).json({ message: invalid });
-    }
-    const mail = { to: body.email, subject: body.subject, text: body.message ?? "" };
+    const mail = result.mail;
 
     if (!env.EMAIL || !env.PASS) {
       log.error("Error sending email: EMAIL or PASS is not set");
